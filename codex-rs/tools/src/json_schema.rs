@@ -198,73 +198,176 @@ fn collapse_deep_schema_objects_from_root(value: &mut JsonValue) {
 }
 
 fn compact_schema_fits_budget(value: &JsonValue) -> bool {
-    compact_json_len(value) <= MAX_COMPACT_TOOL_SCHEMA_BYTES
+    compact_normalized_schema_len(value) <= MAX_COMPACT_TOOL_SCHEMA_BYTES
 }
 
-fn compact_json_len(value: &JsonValue) -> usize {
-    serde_json::to_vec(value)
+fn compact_normalized_schema_len(value: &JsonValue) -> usize {
+    serde_json::from_value::<JsonSchema>(value.clone())
+        .and_then(|schema| serde_json::to_vec(&schema))
         .map(|json| json.len())
-        .unwrap_or(usize::MAX)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SchemaTraversalContext {
-    SchemaObject,
-    PropertiesMap,
+enum DefinitionTraversal {
+    Include,
+    Skip,
 }
 
 fn strip_schema_descriptions(value: &mut JsonValue) {
-    strip_schema_descriptions_in_context(value, SchemaTraversalContext::SchemaObject);
-}
-
-fn strip_schema_descriptions_in_context(value: &mut JsonValue, context: SchemaTraversalContext) {
     match value {
         JsonValue::Array(values) => {
             for value in values {
-                strip_schema_descriptions_in_context(value, SchemaTraversalContext::SchemaObject);
+                strip_schema_descriptions(value);
             }
         }
-        JsonValue::Object(map) => match context {
-            SchemaTraversalContext::SchemaObject => {
-                map.remove("description");
-
-                for (key, value) in map {
-                    if key == "enum" {
-                        continue;
-                    }
-
-                    let child_context = if key == "properties" {
-                        SchemaTraversalContext::PropertiesMap
-                    } else {
-                        SchemaTraversalContext::SchemaObject
-                    };
-                    strip_schema_descriptions_in_context(value, child_context);
-                }
-            }
-            SchemaTraversalContext::PropertiesMap => {
-                for value in map.values_mut() {
-                    strip_schema_descriptions_in_context(
-                        value,
-                        SchemaTraversalContext::SchemaObject,
-                    );
-                }
-            }
-        },
+        JsonValue::Object(map) => {
+            map.remove("description");
+            for_each_schema_child_mut(map, DefinitionTraversal::Include, &mut |value| {
+                strip_schema_descriptions(value);
+            });
+        }
         _ => {}
     }
 }
 
-/// Drop root definition tables without rewriting `$ref`s. Responses API
-/// non-strict schema parsing tolerates refs to missing definitions by treating
-/// them as empty schemas, and Codex sends these tool schemas with `strict:
-/// false`.
+fn visit_schema_objects(
+    value: &JsonValue,
+    definition_traversal: DefinitionTraversal,
+    visitor: &mut impl FnMut(&JsonValue),
+) {
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                visit_schema_objects(value, definition_traversal, visitor);
+            }
+        }
+        JsonValue::Object(map) => {
+            visitor(value);
+            for_each_schema_child(map, definition_traversal, &mut |value| {
+                visit_schema_objects(value, definition_traversal, visitor);
+            });
+        }
+        _ => {}
+    }
+}
+
+fn for_each_schema_child_mut(
+    map: &mut serde_json::Map<String, JsonValue>,
+    definition_traversal: DefinitionTraversal,
+    visitor: &mut impl FnMut(&mut JsonValue),
+) {
+    if let Some(properties) = map.get_mut("properties")
+        && let Some(properties_map) = properties.as_object_mut()
+    {
+        for value in properties_map.values_mut() {
+            visitor(value);
+        }
+    }
+
+    for key in ["items", "prefixItems", "anyOf", "oneOf", "allOf"] {
+        if let Some(value) = map.get_mut(key) {
+            visitor(value);
+        }
+    }
+
+    if let Some(additional_properties) = map.get_mut("additionalProperties")
+        && !matches!(additional_properties, JsonValue::Bool(_))
+    {
+        visitor(additional_properties);
+    }
+
+    if definition_traversal == DefinitionTraversal::Include {
+        for key in ["$defs", "definitions"] {
+            if let Some(definitions) = map.get_mut(key)
+                && let Some(definitions_map) = definitions.as_object_mut()
+            {
+                for value in definitions_map.values_mut() {
+                    visitor(value);
+                }
+            }
+        }
+    }
+}
+
+fn for_each_schema_child(
+    map: &serde_json::Map<String, JsonValue>,
+    definition_traversal: DefinitionTraversal,
+    visitor: &mut impl FnMut(&JsonValue),
+) {
+    if let Some(properties) = map.get("properties")
+        && let Some(properties_map) = properties.as_object()
+    {
+        for value in properties_map.values() {
+            visitor(value);
+        }
+    }
+
+    for key in ["items", "prefixItems", "anyOf", "oneOf", "allOf"] {
+        if let Some(value) = map.get(key) {
+            visitor(value);
+        }
+    }
+
+    if let Some(additional_properties) = map.get("additionalProperties")
+        && !matches!(additional_properties, JsonValue::Bool(_))
+    {
+        visitor(additional_properties);
+    }
+
+    if definition_traversal == DefinitionTraversal::Include {
+        for key in ["$defs", "definitions"] {
+            if let Some(definitions) = map.get(key)
+                && let Some(definitions_map) = definitions.as_object()
+            {
+                for value in definitions_map.values() {
+                    visitor(value);
+                }
+            }
+        }
+    }
+}
+
+/// Replace local definition refs with empty schemas before dropping root
+/// definition tables, so downstream behavior does not depend on how a schema
+/// parser handles refs to missing definitions.
 fn drop_schema_definitions(value: &mut JsonValue) {
+    rewrite_definition_refs_to_empty_schemas(value);
+
     let JsonValue::Object(map) = value else {
         return;
     };
 
     map.remove("$defs");
     map.remove("definitions");
+}
+
+fn rewrite_definition_refs_to_empty_schemas(value: &mut JsonValue) {
+    let JsonValue::Object(map) = value else {
+        if let JsonValue::Array(values) = value {
+            for value in values {
+                rewrite_definition_refs_to_empty_schemas(value);
+            }
+        }
+        return;
+    };
+
+    if map
+        .get("$ref")
+        .and_then(JsonValue::as_str)
+        .and_then(parse_local_definition_ref)
+        .is_some()
+    {
+        *value = json!({});
+        return;
+    }
+
+    let JsonValue::Object(map) = value else {
+        return;
+    };
+    for_each_schema_child_mut(map, DefinitionTraversal::Skip, &mut |value| {
+        rewrite_definition_refs_to_empty_schemas(value);
+    });
 }
 
 fn collapse_deep_schema_objects(value: &mut JsonValue, depth: usize) {
@@ -280,29 +383,9 @@ fn collapse_deep_schema_objects(value: &mut JsonValue, depth: usize) {
                 return;
             }
 
-            if let Some(properties) = map.get_mut("properties")
-                && let Some(properties_map) = properties.as_object_mut()
-            {
-                for value in properties_map.values_mut() {
-                    collapse_deep_schema_objects(value, depth + 1);
-                }
-            }
-
-            if let Some(items) = map.get_mut("items") {
-                collapse_deep_schema_objects(items, depth + 1);
-            }
-
-            if let Some(additional_properties) = map.get_mut("additionalProperties")
-                && !matches!(additional_properties, JsonValue::Bool(_))
-            {
-                collapse_deep_schema_objects(additional_properties, depth + 1);
-            }
-
-            for key in ["anyOf", "oneOf", "allOf"] {
-                if let Some(value) = map.get_mut(key) {
-                    collapse_deep_schema_objects(value, depth + 1);
-                }
-            }
+            for_each_schema_child_mut(map, DefinitionTraversal::Skip, &mut |value| {
+                collapse_deep_schema_objects(value, depth + 1);
+            });
         }
         _ => {}
     }
@@ -516,69 +599,19 @@ fn collect_reachable_definitions(value: &JsonValue) -> BTreeSet<DefinitionPointe
 }
 
 fn collect_refs_outside_definitions(value: &JsonValue, refs: &mut Vec<DefinitionPointer>) {
-    collect_refs_outside_definitions_in_context(value, refs, SchemaTraversalContext::SchemaObject);
-}
-
-fn collect_refs_outside_definitions_in_context(
-    value: &JsonValue,
-    refs: &mut Vec<DefinitionPointer>,
-    context: SchemaTraversalContext,
-) {
-    match value {
-        JsonValue::Array(values) => {
-            for value in values {
-                collect_refs_outside_definitions_in_context(
-                    value,
-                    refs,
-                    SchemaTraversalContext::SchemaObject,
-                );
-            }
+    visit_schema_objects(value, DefinitionTraversal::Skip, &mut |value| {
+        if let JsonValue::Object(map) = value {
+            collect_ref_from_map(map, refs);
         }
-        JsonValue::Object(map) => match context {
-            SchemaTraversalContext::SchemaObject => {
-                collect_ref_from_map(map, refs);
-                for (key, value) in map {
-                    if key == "$defs" || key == "definitions" {
-                        continue;
-                    }
-
-                    let child_context = if key == "properties" {
-                        SchemaTraversalContext::PropertiesMap
-                    } else {
-                        SchemaTraversalContext::SchemaObject
-                    };
-                    collect_refs_outside_definitions_in_context(value, refs, child_context);
-                }
-            }
-            SchemaTraversalContext::PropertiesMap => {
-                for value in map.values() {
-                    collect_refs_outside_definitions_in_context(
-                        value,
-                        refs,
-                        SchemaTraversalContext::SchemaObject,
-                    );
-                }
-            }
-        },
-        _ => {}
-    }
+    });
 }
 
 fn collect_refs(value: &JsonValue, refs: &mut Vec<DefinitionPointer>) {
-    match value {
-        JsonValue::Array(values) => {
-            for value in values {
-                collect_refs(value, refs);
-            }
-        }
-        JsonValue::Object(map) => {
+    visit_schema_objects(value, DefinitionTraversal::Include, &mut |value| {
+        if let JsonValue::Object(map) = value {
             collect_ref_from_map(map, refs);
-            for value in map.values() {
-                collect_refs(value, refs);
-            }
         }
-        _ => {}
-    }
+    });
 }
 
 fn collect_ref_from_map(
