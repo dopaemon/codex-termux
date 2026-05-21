@@ -448,10 +448,14 @@ impl Client {
         payload: RateLimitStatusPayload,
     ) -> Vec<RateLimitSnapshot> {
         let plan_type = Some(Self::map_plan_type(payload.plan_type));
-        let rate_limit_reached_type = payload
-            .rate_limit_reached_type
-            .flatten()
-            .and_then(|details| Self::map_rate_limit_reached_type(details.kind));
+        let rate_limit_reached_type = if payload.referral_beacon.flatten().is_some() {
+            Some(RateLimitReachedType::ReferralBeacon)
+        } else {
+            payload
+                .rate_limit_reached_type
+                .flatten()
+                .and_then(|details| Self::map_rate_limit_reached_type(details.kind))
+        };
         let mut snapshots = vec![Self::make_rate_limit_snapshot(
             Some("codex".to_string()),
             /*limit_name*/ None,
@@ -661,6 +665,7 @@ mod tests {
             rate_limit_reached_type: Some(Some(BackendRateLimitReachedType {
                 kind: RateLimitReachedKind::WorkspaceMemberCreditsDepleted,
             })),
+            referral_beacon: None,
         };
 
         let snapshots = Client::rate_limit_snapshots_from_payload(payload);
@@ -713,6 +718,7 @@ mod tests {
             }])),
             credits: None,
             rate_limit_reached_type: None,
+            referral_beacon: None,
         };
 
         let snapshots = Client::rate_limit_snapshots_from_payload(payload);
@@ -796,6 +802,7 @@ mod tests {
                 credits: None,
                 additional_rate_limits: None,
                 rate_limit_reached_type: Some(Some(BackendRateLimitReachedType { kind })),
+                referral_beacon: None,
             };
 
             let snapshots = Client::rate_limit_snapshots_from_payload(payload);
@@ -811,6 +818,7 @@ mod tests {
             credits: None,
             additional_rate_limits: None,
             rate_limit_reached_type: None,
+            referral_beacon: None,
         };
 
         let snapshots = Client::rate_limit_snapshots_from_payload(payload);

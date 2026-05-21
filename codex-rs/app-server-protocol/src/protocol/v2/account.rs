@@ -289,6 +289,7 @@ pub enum RateLimitReachedType {
     WorkspaceMemberCreditsDepleted,
     WorkspaceOwnerUsageLimitReached,
     WorkspaceMemberUsageLimitReached,
+    ReferralBeacon,
 }
 
 impl From<CoreRateLimitReachedType> for RateLimitReachedType {
@@ -307,6 +308,7 @@ impl From<CoreRateLimitReachedType> for RateLimitReachedType {
             CoreRateLimitReachedType::WorkspaceMemberUsageLimitReached => {
                 Self::WorkspaceMemberUsageLimitReached
             }
+            CoreRateLimitReachedType::ReferralBeacon => Self::ReferralBeacon,
         }
     }
 }
@@ -327,6 +329,7 @@ impl From<RateLimitReachedType> for CoreRateLimitReachedType {
             RateLimitReachedType::WorkspaceMemberUsageLimitReached => {
                 Self::WorkspaceMemberUsageLimitReached
             }
+            RateLimitReachedType::ReferralBeacon => Self::ReferralBeacon,
         }
     }
 }

@@ -44,6 +44,13 @@ pub struct RateLimitStatusPayload {
         skip_serializing_if = "Option::is_none"
     )]
     pub rate_limit_reached_type: Option<Option<RateLimitReachedType>>,
+    #[serde(
+        rename = "referral_beacon",
+        default,
+        with = "::serde_with::rust::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub referral_beacon: Option<Option<serde_json::Value>>,
 }
 
 impl RateLimitStatusPayload {
@@ -54,6 +61,7 @@ impl RateLimitStatusPayload {
             credits: None,
             additional_rate_limits: None,
             rate_limit_reached_type: None,
+            referral_beacon: None,
         }
     }
 }

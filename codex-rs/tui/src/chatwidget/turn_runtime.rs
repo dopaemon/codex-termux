@@ -363,42 +363,48 @@ impl ChatWidget {
     }
 
     pub(super) fn on_rate_limit_error(&mut self, error_kind: RateLimitErrorKind, message: String) {
-        let rate_limit_reached_type = self.codex_rate_limit_reached_type.map(|kind| {
-            if matches!(error_kind, RateLimitErrorKind::UsageLimit) {
-                match kind {
-                    RateLimitReachedType::WorkspaceOwnerCreditsDepleted => {
-                        RateLimitReachedType::WorkspaceOwnerUsageLimitReached
-                    }
-                    RateLimitReachedType::WorkspaceMemberCreditsDepleted => {
-                        RateLimitReachedType::WorkspaceMemberUsageLimitReached
-                    }
-                    other => other,
-                }
-            } else {
-                kind
-            }
-        });
-        self.codex_rate_limit_reached_type = rate_limit_reached_type;
+        let rate_limit_reached_type = self.codex_rate_limit_reached_type;
 
         match rate_limit_reached_type {
+            Some(RateLimitReachedType::ReferralBeacon) => {
+                let reset_date = message
+                    .split(" or try again at ")
+                    .nth(1)
+                    .or_else(|| message.split(" Try again at ").nth(1))
+                    .and_then(|suffix| suffix.strip_suffix('.'));
+                let message = match reset_date {
+                    Some(reset_date) => {
+                        format!(
+                            "You\u{2019}re out of Codex credits. Your rate limit resets on {reset_date}"
+                        )
+                    }
+                    None => "You\u{2019}re out of Codex credits".to_string(),
+                };
+                self.on_error(message);
+            }
             Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted) => {
                 self.on_error(
-                    "You're out of credits. Your workspace is out of credits. Add credits to continue using Codex."
+                    "Your workspace is out of credits. Add credits to continue using Codex."
                         .to_string(),
                 );
             }
             Some(RateLimitReachedType::WorkspaceOwnerUsageLimitReached) => {
                 self.on_error(
-                    "Usage limit reached. You've reached your usage limit. Increase your limits to continue using codex."
+                    "You've reached your usage limit. Increase your limits to continue using codex."
                         .to_string(),
                 );
             }
             Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted) => {
-                self.on_error(message);
+                self.on_error(
+                    "Your workspace is out of credits. Ask your workspace owner to add more."
+                        .to_string(),
+                );
                 self.open_workspace_owner_nudge_prompt(AddCreditsNudgeCreditType::Credits);
             }
             Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached) => {
-                self.on_error(message);
+                self.on_error(
+                    "Request a limit increase from your owner to continue using codex.".to_string(),
+                );
                 self.open_workspace_owner_nudge_prompt(AddCreditsNudgeCreditType::UsageLimit);
             }
             Some(RateLimitReachedType::RateLimitReached) | None => {
