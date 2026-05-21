@@ -229,6 +229,10 @@ fn strip_schema_descriptions_in_context(value: &mut JsonValue, context: SchemaTr
                 map.remove("description");
 
                 for (key, value) in map {
+                    if key == "enum" {
+                        continue;
+                    }
+
                     let child_context = if key == "properties" {
                         SchemaTraversalContext::PropertiesMap
                     } else {
