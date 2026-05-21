@@ -4716,6 +4716,14 @@ fn local_dev_builds_force_file_cli_auth_store_modes() {
         resolve_cli_auth_credentials_store_mode(AuthCredentialsStoreMode::Keyring, "1.2.3"),
         AuthCredentialsStoreMode::Keyring,
     );
+    assert_eq!(
+        resolve_cli_auth_credentials_store_mode(AuthCredentialsStoreMode::Auto, "1.2.3"),
+        if cfg!(target_os = "android") {
+            AuthCredentialsStoreMode::File
+        } else {
+            AuthCredentialsStoreMode::Auto
+        },
+    );
 }
 
 #[test]
@@ -4737,6 +4745,14 @@ fn local_dev_builds_force_file_mcp_oauth_store_modes() {
     assert_eq!(
         resolve_mcp_oauth_credentials_store_mode(OAuthCredentialsStoreMode::Keyring, "1.2.3"),
         OAuthCredentialsStoreMode::Keyring,
+    );
+    assert_eq!(
+        resolve_mcp_oauth_credentials_store_mode(OAuthCredentialsStoreMode::Auto, "1.2.3"),
+        if cfg!(target_os = "android") {
+            OAuthCredentialsStoreMode::File
+        } else {
+            OAuthCredentialsStoreMode::Auto
+        },
     );
 }
 

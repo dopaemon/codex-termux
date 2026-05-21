@@ -217,6 +217,9 @@ fn resolve_cli_auth_credentials_store_mode(
     configured: AuthCredentialsStoreMode,
     package_version: &str,
 ) -> AuthCredentialsStoreMode {
+    if cfg!(target_os = "android") && matches!(configured, AuthCredentialsStoreMode::Auto) {
+        return AuthCredentialsStoreMode::File;
+    }
     match (package_version, configured) {
         (
             LOCAL_DEV_BUILD_VERSION,
@@ -230,6 +233,9 @@ fn resolve_mcp_oauth_credentials_store_mode(
     configured: OAuthCredentialsStoreMode,
     package_version: &str,
 ) -> OAuthCredentialsStoreMode {
+    if cfg!(target_os = "android") && matches!(configured, OAuthCredentialsStoreMode::Auto) {
+        return OAuthCredentialsStoreMode::File;
+    }
     match (package_version, configured) {
         (
             LOCAL_DEV_BUILD_VERSION,
