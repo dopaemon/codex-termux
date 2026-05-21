@@ -157,6 +157,7 @@ pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, s
     let mut input_schema = input_schema.clone();
     sanitize_json_schema(&mut input_schema);
     prune_unreachable_definitions(&mut input_schema);
+    compact_large_tool_schema(&mut input_schema);
     let schema: JsonSchema = serde_json::from_value(input_schema)?;
     if matches!(
         schema.schema_type,
@@ -165,6 +166,152 @@ pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, s
         return Err(singleton_null_schema_error());
     }
     Ok(schema)
+}
+
+// Use compact JSON bytes as a cheap local proxy for the 1k-token schema budget.
+const MAX_COMPACT_TOOL_SCHEMA_BYTES: usize = 4_000;
+const MAX_COMPACT_TOOL_SCHEMA_DEPTH: usize = 2;
+
+/// Shrink unusually large tool schemas while preserving the top-level argument
+/// surface. Compaction is best-effort rather than a hard cap: it runs only
+/// after schema sanitization/pruning and applies increasingly lossy passes
+/// while the schema remains over budget.
+fn compact_large_tool_schema(value: &mut JsonValue) {
+    for pass in LARGE_SCHEMA_COMPACTION_PASSES {
+        if compact_schema_fits_budget(value) {
+            break;
+        }
+        pass(value);
+    }
+}
+
+type LargeSchemaCompactionPass = fn(&mut JsonValue);
+
+const LARGE_SCHEMA_COMPACTION_PASSES: &[LargeSchemaCompactionPass] = &[
+    strip_schema_descriptions,
+    drop_schema_definitions,
+    collapse_deep_schema_objects_from_root,
+];
+
+fn collapse_deep_schema_objects_from_root(value: &mut JsonValue) {
+    collapse_deep_schema_objects(value, /*depth*/ 0);
+}
+
+fn compact_schema_fits_budget(value: &JsonValue) -> bool {
+    compact_json_len(value) <= MAX_COMPACT_TOOL_SCHEMA_BYTES
+}
+
+fn compact_json_len(value: &JsonValue) -> usize {
+    serde_json::to_vec(value)
+        .map(|json| json.len())
+        .unwrap_or(usize::MAX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaTraversalContext {
+    SchemaObject,
+    PropertiesMap,
+}
+
+fn strip_schema_descriptions(value: &mut JsonValue) {
+    strip_schema_descriptions_in_context(value, SchemaTraversalContext::SchemaObject);
+}
+
+fn strip_schema_descriptions_in_context(value: &mut JsonValue, context: SchemaTraversalContext) {
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                strip_schema_descriptions_in_context(value, SchemaTraversalContext::SchemaObject);
+            }
+        }
+        JsonValue::Object(map) => match context {
+            SchemaTraversalContext::SchemaObject => {
+                map.remove("description");
+
+                for (key, value) in map {
+                    let child_context = if key == "properties" {
+                        SchemaTraversalContext::PropertiesMap
+                    } else {
+                        SchemaTraversalContext::SchemaObject
+                    };
+                    strip_schema_descriptions_in_context(value, child_context);
+                }
+            }
+            SchemaTraversalContext::PropertiesMap => {
+                for value in map.values_mut() {
+                    strip_schema_descriptions_in_context(
+                        value,
+                        SchemaTraversalContext::SchemaObject,
+                    );
+                }
+            }
+        },
+        _ => {}
+    }
+}
+
+/// Drop root definition tables without rewriting `$ref`s. Responses API
+/// non-strict schema parsing tolerates refs to missing definitions by treating
+/// them as empty schemas, and Codex sends these tool schemas with `strict:
+/// false`.
+fn drop_schema_definitions(value: &mut JsonValue) {
+    let JsonValue::Object(map) = value else {
+        return;
+    };
+
+    map.remove("$defs");
+    map.remove("definitions");
+}
+
+fn collapse_deep_schema_objects(value: &mut JsonValue, depth: usize) {
+    match value {
+        JsonValue::Array(values) => {
+            for value in values {
+                collapse_deep_schema_objects(value, depth);
+            }
+        }
+        JsonValue::Object(map) => {
+            if depth >= MAX_COMPACT_TOOL_SCHEMA_DEPTH && is_complex_schema_object(map) {
+                *value = json!({});
+                return;
+            }
+
+            if let Some(properties) = map.get_mut("properties")
+                && let Some(properties_map) = properties.as_object_mut()
+            {
+                for value in properties_map.values_mut() {
+                    collapse_deep_schema_objects(value, depth + 1);
+                }
+            }
+
+            if let Some(items) = map.get_mut("items") {
+                collapse_deep_schema_objects(items, depth + 1);
+            }
+
+            if let Some(additional_properties) = map.get_mut("additionalProperties")
+                && !matches!(additional_properties, JsonValue::Bool(_))
+            {
+                collapse_deep_schema_objects(additional_properties, depth + 1);
+            }
+
+            for key in ["anyOf", "oneOf", "allOf"] {
+                if let Some(value) = map.get_mut(key) {
+                    collapse_deep_schema_objects(value, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_complex_schema_object(map: &serde_json::Map<String, JsonValue>) -> bool {
+    map.contains_key("properties")
+        || map.contains_key("items")
+        || map.contains_key("additionalProperties")
+        || map.contains_key("anyOf")
+        || map.contains_key("oneOf")
+        || map.contains_key("allOf")
+        || map.contains_key("$ref")
 }
 
 /// Sanitize a JSON Schema (as serde_json::Value) so it can fit our limited
@@ -364,20 +511,14 @@ fn collect_reachable_definitions(value: &JsonValue) -> BTreeSet<DefinitionPointe
     reachable
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RefCollectionContext {
-    SchemaObject,
-    PropertiesMap,
-}
-
 fn collect_refs_outside_definitions(value: &JsonValue, refs: &mut Vec<DefinitionPointer>) {
-    collect_refs_outside_definitions_in_context(value, refs, RefCollectionContext::SchemaObject);
+    collect_refs_outside_definitions_in_context(value, refs, SchemaTraversalContext::SchemaObject);
 }
 
 fn collect_refs_outside_definitions_in_context(
     value: &JsonValue,
     refs: &mut Vec<DefinitionPointer>,
-    context: RefCollectionContext,
+    context: SchemaTraversalContext,
 ) {
     match value {
         JsonValue::Array(values) => {
@@ -385,12 +526,12 @@ fn collect_refs_outside_definitions_in_context(
                 collect_refs_outside_definitions_in_context(
                     value,
                     refs,
-                    RefCollectionContext::SchemaObject,
+                    SchemaTraversalContext::SchemaObject,
                 );
             }
         }
         JsonValue::Object(map) => match context {
-            RefCollectionContext::SchemaObject => {
+            SchemaTraversalContext::SchemaObject => {
                 collect_ref_from_map(map, refs);
                 for (key, value) in map {
                     if key == "$defs" || key == "definitions" {
@@ -398,19 +539,19 @@ fn collect_refs_outside_definitions_in_context(
                     }
 
                     let child_context = if key == "properties" {
-                        RefCollectionContext::PropertiesMap
+                        SchemaTraversalContext::PropertiesMap
                     } else {
-                        RefCollectionContext::SchemaObject
+                        SchemaTraversalContext::SchemaObject
                     };
                     collect_refs_outside_definitions_in_context(value, refs, child_context);
                 }
             }
-            RefCollectionContext::PropertiesMap => {
+            SchemaTraversalContext::PropertiesMap => {
                 for value in map.values() {
                     collect_refs_outside_definitions_in_context(
                         value,
                         refs,
-                        RefCollectionContext::SchemaObject,
+                        SchemaTraversalContext::SchemaObject,
                     );
                 }
             }
