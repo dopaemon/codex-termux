@@ -1,0 +1,144 @@
+name: sync-openai-codex
+
+on:
+  schedule:
+    # 00:00 GMT+7 == 17:00 UTC (previous day)
+    - cron: "0 17 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-openai-codex
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  merge-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Configure git
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/openai/codex
+          else
+            git remote add upstream https://github.com/openai/codex
+          fi
+          git fetch upstream main --tags
+
+      - name: Check latest upstream tag
+        id: tagcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          normalize_latest_release_tag() {
+            local rust_tag
+            rust_tag="$(
+              sed -nE 's@.*(rust-v[0-9][0-9A-Za-z.+-]*)$@\1@p' \
+                | sort -Vu \
+                | tail -n 1 || true
+            )"
+            if [[ -n "${rust_tag}" ]]; then
+              printf '%s\n' "${rust_tag}"
+              return 0
+            fi
+            grep -E '^v[0-9][0-9A-Za-z.+-]*$' \
+              | sort -Vu \
+              | tail -n 1 || true
+          }
+
+          latest_upstream_tag="$(
+            git ls-remote --tags --refs https://github.com/openai/codex \
+              | awk '{print $2}' \
+              | sed 's#refs/tags/##' \
+              | normalize_latest_release_tag
+          )"
+          latest_origin_tag="$(
+            git ls-remote --tags --refs origin \
+              | awk '{print $2}' \
+              | sed 's#refs/tags/##' \
+              | normalize_latest_release_tag
+          )"
+
+          echo "latest_upstream_tag=${latest_upstream_tag}" >> "${GITHUB_OUTPUT}"
+          echo "latest_origin_tag=${latest_origin_tag}" >> "${GITHUB_OUTPUT}"
+
+          if [[ -z "${latest_upstream_tag}" || "${latest_upstream_tag}" == "${latest_origin_tag}" ]]; then
+            echo "has_new_tag=false" >> "${GITHUB_OUTPUT}"
+            has_new_tag=false
+          else
+            echo "has_new_tag=true" >> "${GITHUB_OUTPUT}"
+            has_new_tag=true
+          fi
+          echo "upstream latest tag: ${latest_upstream_tag:-<none>}"
+          echo "origin latest tag: ${latest_origin_tag:-<none>}"
+          echo "has_new_tag: ${has_new_tag}"
+
+      - name: Merge upstream main
+        if: ${{ steps.tagcheck.outputs.has_new_tag == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git merge --no-ff --no-edit upstream/main; then
+            conflict_files="$(git diff --name-only --diff-filter=U || true)"
+            if [[ -n "${conflict_files}" ]]; then
+              while IFS= read -r path; do
+                [[ -z "${path}" ]] && continue
+                if [[ "${path}" == .github/* ]]; then
+                  git checkout --ours -- "${path}" 2>/dev/null || git rm -f -- "${path}"
+                else
+                  git checkout --theirs -- "${path}" 2>/dev/null || git rm -f -- "${path}"
+                fi
+                if [[ -e "${path}" ]]; then
+                  git add "${path}"
+                fi
+              done <<< "${conflict_files}"
+              git commit --no-edit
+            else
+              echo "Merge failed without conflict files; aborting."
+              git merge --abort
+              exit 1
+            fi
+          fi
+
+      - name: Push merge commit
+        if: ${{ steps.tagcheck.outputs.has_new_tag == 'true' }}
+        shell: bash
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${PUSH_TOKEN:?Missing secret PUSH_TOKEN (PAT with repo + workflow scopes)}"
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
+          tag="${{ steps.tagcheck.outputs.latest_upstream_tag }}"
+          if git ls-remote --tags --refs origin "refs/tags/${tag}" | grep -q "refs/tags/${tag}"; then
+            echo "Tag already exists on origin: ${tag}"
+          else
+            git tag -d "${tag}" >/dev/null 2>&1 || true
+            git tag "${tag}" HEAD
+            git push origin "refs/tags/${tag}"
+          fi
+
+      - name: No-op summary
+        if: ${{ steps.tagcheck.outputs.has_new_tag != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "No new upstream release tag. Skip merge."

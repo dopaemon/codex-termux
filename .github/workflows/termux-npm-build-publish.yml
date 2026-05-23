@@ -1,0 +1,410 @@
+name: termux-npm-build-publish
+
+on:
+  push:
+    tags:
+      - "rust-v*"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref or branch to build
+        required: true
+        type: string
+        default: main
+      publish_npm:
+        description: Publish npm package
+        required: true
+        type: boolean
+        default: false
+      create_release:
+        description: Create/update GitHub release with built tarball
+        required: true
+        type: boolean
+        default: false
+      npm_tag:
+        description: npm dist-tag
+        required: true
+        type: string
+        default: test
+      package_name:
+        description: npm package name
+        required: true
+        type: string
+        default: "@dopaemon/codex-termux"
+      package_version:
+        description: Optional explicit version (default auto-derived)
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build-android-arm64:
+    name: Build Android ARM64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      actions: write
+    env:
+      ANDROID_NDK_VERSION: "28.2.13676358"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: 20G
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref_name }}
+          persist-credentials: false
+
+      - name: Setup Swap Space
+        uses: thejerrybao/setup-swap-space@v1
+        with:
+          swap-space-path: /swapfile
+          swap-size-gb: 32
+          remove-existing-swap-files: true
+
+      - name: Tune Swap Aggressiveness
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sysctl -w vm.swappiness=80
+          sudo sysctl -w vm.page-cluster=0
+          sudo swapoff /swapfile || true
+          sudo swapon -p 32767 /swapfile
+          echo "===== Swap Tuning ====="
+          cat /proc/sys/vm/swappiness
+          cat /proc/sys/vm/page-cluster
+          swapon --show --bytes
+
+      - name: Cache Cargo registry/git and target
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: termux-cargo-${{ runner.os }}-aarch64-android-${{ hashFiles('codex-rs/Cargo.lock') }}
+          restore-keys: |
+            termux-cargo-${{ runner.os }}-aarch64-android-
+
+      - name: Cache OpenSSL Android build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.3
+        with:
+          path: .cache/openssl-android-aarch64-3.3.2
+          key: termux-openssl-${{ runner.os }}-aarch64-android-3.3.2-ndk-${{ env.ANDROID_NDK_VERSION }}
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler perl make
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Init sccache
+        shell: bash
+        run: |
+          set -euo pipefail
+          sccache --stop-server || true
+          sccache --start-server
+          sccache --zero-stats
+          which sccache
+          echo "RUSTC_WRAPPER=${RUSTC_WRAPPER}"
+          echo "SCCACHE_GHA_ENABLED=${SCCACHE_GHA_ENABLED}"
+          echo "SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?ANDROID_HOME must be set on the GitHub runner}"
+          export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/cmdline-tools/bin:${PATH}"
+          command -v sdkmanager
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
+          ndk_home="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ndk_home}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_ROOT=${ndk_home}" >> "${GITHUB_ENV}"
+
+      - name: Build OpenSSL for Android target
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPENSSL_VERSION="3.3.2"
+          OPENSSL_PREFIX="${GITHUB_WORKSPACE}/.cache/openssl-android-aarch64-${OPENSSL_VERSION}"
+          mkdir -p "${GITHUB_WORKSPACE}/.cache"
+          if [[ -f "${OPENSSL_PREFIX}/lib/libssl.a" && -f "${OPENSSL_PREFIX}/lib/libcrypto.a" ]]; then
+            echo "Using cached OpenSSL at ${OPENSSL_PREFIX}"
+            echo "OPENSSL_DIR=${OPENSSL_PREFIX}" >> "${GITHUB_ENV}"
+            echo "OPENSSL_LIB_DIR=${OPENSSL_PREFIX}/lib" >> "${GITHUB_ENV}"
+            echo "OPENSSL_INCLUDE_DIR=${OPENSSL_PREFIX}/include" >> "${GITHUB_ENV}"
+            echo "AARCH64_LINUX_ANDROID_OPENSSL_DIR=${OPENSSL_PREFIX}" >> "${GITHUB_ENV}"
+            echo "AARCH64_LINUX_ANDROID_OPENSSL_LIB_DIR=${OPENSSL_PREFIX}/lib" >> "${GITHUB_ENV}"
+            echo "AARCH64_LINUX_ANDROID_OPENSSL_INCLUDE_DIR=${OPENSSL_PREFIX}/include" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+
+          OPENSSL_SRC_DIR="${RUNNER_TEMP}/openssl-${OPENSSL_VERSION}"
+          curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" -o "${RUNNER_TEMP}/openssl.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/openssl.tar.gz" -C "${RUNNER_TEMP}"
+          export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+          cd "${OPENSSL_SRC_DIR}"
+          ./Configure android-arm64 no-tests no-shared --prefix="${OPENSSL_PREFIX}"
+          make -j"$(nproc)"
+          make install_sw
+          echo "OPENSSL_DIR=${OPENSSL_PREFIX}" >> "${GITHUB_ENV}"
+          echo "OPENSSL_LIB_DIR=${OPENSSL_PREFIX}/lib" >> "${GITHUB_ENV}"
+          echo "OPENSSL_INCLUDE_DIR=${OPENSSL_PREFIX}/include" >> "${GITHUB_ENV}"
+          echo "AARCH64_LINUX_ANDROID_OPENSSL_DIR=${OPENSSL_PREFIX}" >> "${GITHUB_ENV}"
+          echo "AARCH64_LINUX_ANDROID_OPENSSL_LIB_DIR=${OPENSSL_PREFIX}/lib" >> "${GITHUB_ENV}"
+          echo "AARCH64_LINUX_ANDROID_OPENSSL_INCLUDE_DIR=${OPENSSL_PREFIX}/include" >> "${GITHUB_ENV}"
+
+      - name: Fetch Android rusty_v8 artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          v8_version="$(
+            python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          lock = tomllib.loads(Path("codex-rs/Cargo.lock").read_text(encoding="utf-8"))
+          versions = sorted({pkg["version"] for pkg in lock["package"] if pkg["name"] == "v8"})
+          if len(versions) != 1:
+              raise SystemExit(f"expected exactly one v8 version, found: {versions}")
+          print(versions[0])
+          PY
+          )"
+
+          target="aarch64-linux-android"
+          release_tag="rusty-v8-v${v8_version}"
+          repo="DioNanos/codex-termux"
+          base_url="https://github.com/${repo}/releases/download/${release_tag}"
+          archive_name="librusty_v8_release_${target}.a.gz"
+          binding_name="src_binding_release_${target}.rs"
+
+          out_dir="${RUNNER_TEMP}/rusty_v8/${release_tag}"
+          mkdir -p "${out_dir}"
+          archive_path="${out_dir}/${archive_name}"
+          binding_path="${out_dir}/${binding_name}"
+
+          curl -fL "${base_url}/${archive_name}" -o "${archive_path}"
+          curl -fL "${base_url}/${binding_name}" -o "${binding_path}"
+
+          echo "RUSTY_V8_ARCHIVE=${archive_path}" >> "${GITHUB_ENV}"
+          echo "RUSTY_V8_SRC_BINDING_PATH=${binding_path}" >> "${GITHUB_ENV}"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          log_resource_snapshot() {
+            local mem_total_kb mem_avail_kb mem_used_kb mem_used_mib mem_total_mib mem_used_pct
+            local swap_total_kb swap_free_kb swap_used_kb swap_used_mib swap_total_mib swap_used_pct
+            local disk_usage
+
+            mem_total_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+            mem_avail_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+            mem_used_kb=$((mem_total_kb - mem_avail_kb))
+            mem_used_mib=$((mem_used_kb / 1024))
+            mem_total_mib=$((mem_total_kb / 1024))
+            mem_used_pct=$((100 * mem_used_kb / mem_total_kb))
+
+            swap_total_kb=$(awk '/SwapTotal:/ {print $2}' /proc/meminfo)
+            swap_free_kb=$(awk '/SwapFree:/ {print $2}' /proc/meminfo)
+            if [ "${swap_total_kb}" -gt 0 ]; then
+              swap_used_kb=$((swap_total_kb - swap_free_kb))
+              swap_used_mib=$((swap_used_kb / 1024))
+              swap_total_mib=$((swap_total_kb / 1024))
+              swap_used_pct=$((100 * swap_used_kb / swap_total_kb))
+            else
+              swap_used_mib=0
+              swap_total_mib=0
+              swap_used_pct=0
+            fi
+
+            disk_usage=$(df -P -BG "${GITHUB_WORKSPACE}" | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}')
+            printf '[monitor] %s | RAM %s/%s MiB (%s%%) | SWAP %s/%s MiB (%s%%) | DISK %s\n' \
+              "$(date +'%F %T')" \
+              "${mem_used_mib}" "${mem_total_mib}" "${mem_used_pct}" \
+              "${swap_used_mib}" "${swap_total_mib}" "${swap_used_pct}" \
+              "${disk_usage}"
+          }
+
+          (
+            while true; do
+              log_resource_snapshot
+              sleep 10
+            done
+          ) &
+          monitor_pid=$!
+          trap 'kill ${monitor_pid} >/dev/null 2>&1 || true' EXIT
+
+          : "${ANDROID_NDK_HOME:?ANDROID_NDK_HOME must point to Android NDK}"
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
+          export LIBLZMA_NO_PKG_CONFIG=1
+          export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${PATH}"
+          export CC_aarch64_linux_android="aarch64-linux-android29-clang"
+          export CXX_aarch64_linux_android="aarch64-linux-android29-clang++"
+          export AR_aarch64_linux_android="llvm-ar"
+          export RANLIB_aarch64_linux_android="llvm-ranlib"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="aarch64-linux-android29-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="llvm-ar"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export OPENSSL_NO_PKG_CONFIG=1
+          export RUSTY_V8_ARCHIVE
+          export RUSTY_V8_SRC_BINDING_PATH
+          cat > "${RUNNER_TEMP}/clear_cache_shim.c" <<'EOF'
+          void __clear_cache(void* start, void* end) {
+            __builtin___clear_cache((char*)start, (char*)end);
+          }
+          EOF
+          aarch64-linux-android29-clang -c "${RUNNER_TEMP}/clear_cache_shim.c" -o "${RUNNER_TEMP}/clear_cache_shim.o"
+          export RUSTFLAGS="${RUSTFLAGS:-} -Clink-arg=${RUNNER_TEMP}/clear_cache_shim.o -Clink-arg=-Wl,--allow-multiple-definition"
+          cd codex-rs
+          cargo build --target aarch64-linux-android --release -p codex-cli -p codex-exec
+
+      - name: Show sccache stats
+        shell: bash
+        run: |
+          set -euo pipefail
+          sccache --show-stats --stats-format=json || true
+
+      - name: Build npm package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          input_version="${{ github.event_name == 'workflow_dispatch' && inputs.package_version || '' }}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == rust-v* ]]; then
+            package_version="${GITHUB_REF_NAME#rust-v}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            package_version="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${input_version}" ]]; then
+            package_version="${input_version}"
+          else
+            base_version="$(node -p "require('./codex-cli/package.json').version")"
+            package_version="${base_version}-termux.${GITHUB_RUN_NUMBER}"
+          fi
+
+          package_name="${{ github.event_name == 'workflow_dispatch' && inputs.package_name || '@dopaemon/codex-termux' }}"
+
+          pkg_root="$(mktemp -d)"
+          mkdir -p "${pkg_root}/bin"
+
+          cp codex-rs/target/aarch64-linux-android/release/codex "${pkg_root}/bin/codex.bin"
+          cp codex-rs/target/aarch64-linux-android/release/codex-exec "${pkg_root}/bin/codex-exec.bin"
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "${pkg_root}/bin/libc++_shared.so"
+
+          cat > "${pkg_root}/bin/codex" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          export LD_LIBRARY_PATH="${HERE}:${LD_LIBRARY_PATH:-}"
+          exec "${HERE}/codex.bin" "$@"
+          EOF
+
+          cat > "${pkg_root}/bin/codex-exec" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+          HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          export LD_LIBRARY_PATH="${HERE}:${LD_LIBRARY_PATH:-}"
+          exec "${HERE}/codex-exec.bin" "$@"
+          EOF
+
+          chmod +x "${pkg_root}/bin/codex" "${pkg_root}/bin/codex-exec" "${pkg_root}/bin/codex.bin" "${pkg_root}/bin/codex-exec.bin"
+
+          cat > "${pkg_root}/package.json" <<EOF
+          {
+            "name": "${package_name}",
+            "version": "${package_version}",
+            "description": "Codex CLI binaries for Termux (Android ARM64)",
+            "license": "Apache-2.0",
+            "bin": {
+              "codex": "bin/codex",
+              "codex-exec": "bin/codex-exec"
+            },
+            "os": ["android"],
+            "cpu": ["arm64"],
+            "files": ["bin"]
+          }
+          EOF
+
+          if [[ -f README.md ]]; then
+            cp README.md "${pkg_root}/README.md"
+          fi
+
+          cd "${pkg_root}"
+          npm pack
+          tarball="$(ls -1 *.tgz)"
+          sha256sum "${tarball}" > "${tarball}.sha256"
+
+          out_dir="${GITHUB_WORKSPACE}/artifacts"
+          mkdir -p "${out_dir}"
+          mv "${tarball}" "${out_dir}/"
+          mv "${tarball}.sha256" "${out_dir}/"
+
+          echo "PACKAGE_TGZ=${out_dir}/${tarball}" >> "${GITHUB_ENV}"
+          echo "PACKAGE_SHA256_FILE=${out_dir}/${tarball}.sha256" >> "${GITHUB_ENV}"
+          echo "PACKAGE_VERSION=${package_version}" >> "${GITHUB_ENV}"
+          echo "RELEASE_TAG=termux-v${package_version}" >> "${GITHUB_ENV}"
+
+      - name: Upload npm tarball artifact
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: codex-termux-android-arm64-${{ env.PACKAGE_VERSION }}
+          path: |
+            ${{ env.PACKAGE_TGZ }}
+            ${{ env.PACKAGE_SHA256_FILE }}
+          if-no-files-found: error
+
+      - name: Create/Update release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" > /dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --target "${GITHUB_SHA}" --title "${RELEASE_TAG}"
+            gh release upload "${RELEASE_TAG}" "${PACKAGE_TGZ}" "${PACKAGE_SHA256_FILE}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${PACKAGE_TGZ}" "${PACKAGE_SHA256_FILE}" \
+              --target "${GITHUB_SHA}" \
+              --title "${RELEASE_TAG}" \
+              --notes "Termux Android ARM64 package ${PACKAGE_VERSION}"
+          fi
+
+      - name: Publish npm
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.publish_npm) || (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/rust-v') || startsWith(github.ref, 'refs/tags/v'))) }}
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm_userconfig="$(mktemp)"
+          trap 'rm -f "${npm_userconfig}"' EXIT
+          chmod 600 "${npm_userconfig}"
+          {
+            echo "registry=https://registry.npmjs.org/"
+            echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}"
+          } > "${npm_userconfig}"
+          npm_tag="${{ github.event_name == 'workflow_dispatch' && inputs.npm_tag || 'latest' }}"
+          NPM_CONFIG_USERCONFIG="${npm_userconfig}" npm publish "${PACKAGE_TGZ}" --tag "${npm_tag}" --access public
