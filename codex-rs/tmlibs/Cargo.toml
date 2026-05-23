@@ -1,0 +1,16 @@
+[package]
+name = "codex-tmlibs"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "codex_tmlibs"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom = "0.2"
+native-tls = "0.2"
+tracing.workspace = true

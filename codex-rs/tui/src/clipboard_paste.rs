@@ -1,12 +1,14 @@
 use std::path::Path;
 use std::path::PathBuf;
-use tempfile::Builder;
 
 #[derive(Debug, Clone)]
 pub enum PasteImageError {
     ClipboardUnavailable(String),
+    #[cfg(not(target_os = "android"))]
     NoImage(String),
+    #[cfg(not(target_os = "android"))]
     EncodeFailed(String),
+    #[cfg(not(target_os = "android"))]
     IoError(String),
 }
 
@@ -14,8 +16,11 @@ impl std::fmt::Display for PasteImageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PasteImageError::ClipboardUnavailable(msg) => write!(f, "clipboard unavailable: {msg}"),
+            #[cfg(not(target_os = "android"))]
             PasteImageError::NoImage(msg) => write!(f, "no image on clipboard: {msg}"),
+            #[cfg(not(target_os = "android"))]
             PasteImageError::EncodeFailed(msg) => write!(f, "could not encode image: {msg}"),
+            #[cfg(not(target_os = "android"))]
             PasteImageError::IoError(msg) => write!(f, "io error: {msg}"),
         }
     }
@@ -48,6 +53,7 @@ pub struct PastedImageInfo {
 
 /// Capture image from system clipboard, encode to PNG, and return bytes + info.
 #[cfg(not(target_os = "android"))]
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
     let _span = tracing::debug_span!("paste_image_as_png").entered();
     tracing::debug!("attempting clipboard image read");
@@ -110,6 +116,7 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
 
 /// Android/Termux does not support arboard; return a clear error.
 #[cfg(target_os = "android")]
+#[allow(dead_code)]
 pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageError> {
     Err(PasteImageError::ClipboardUnavailable(
         "clipboard image paste is unsupported on Android".into(),
@@ -119,6 +126,8 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
 /// Convenience: write to a temp file and return its path + info.
 #[cfg(not(target_os = "android"))]
 pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImageError> {
+    use tempfile::Builder;
+
     // First attempt: read image from system clipboard via arboard (native paths or image data).
     match paste_image_as_png() {
         Ok((png, info)) => {
